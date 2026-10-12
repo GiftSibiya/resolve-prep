@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve Prep — convert videos to DaVinci Resolve-friendly DNxHR intermediates."""
+"""VidPrep — convert videos for phones, editors, and the web."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,8 +24,8 @@ gi.require_version("Gdk", "4.0")
 
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
-APP_ID = "dev.bobo.resolve-prep"
-APP_NAME = "Resolve Prep"
+APP_ID = "dev.bobo.vidprep"
+APP_NAME = "VidPrep"
 VIDEO_EXTENSIONS = {
     ".mp4",
     ".mov",
@@ -40,14 +41,263 @@ VIDEO_EXTENSIONS = {
     ".ts",
 }
 
-PROFILES = [
-    ("dnxhr_lb", "DNxHR LB — smallest, draft / proxy"),
-    ("dnxhr_sq", "DNxHR SQ — recommended edit quality"),
-    ("dnxhr_hq", "DNxHR HQ — higher quality, larger files"),
-    ("dnxhr_hqx", "DNxHR HQX — 10-bit, largest"),
+
+@dataclass(frozen=True)
+class Target:
+    id: str
+    label: str
+    default_subdir: str
+    tonemap_default: bool
+    tonemap_subtitle: str
+
+
+TARGETS: list[Target] = [
+    Target(
+        id="iphone",
+        label="iPhone / iOS playback",
+        default_subdir="Videos/VidPrep",
+        tonemap_default=True,
+        tonemap_subtitle="Tone-map HDR so Photos and the iOS player show correct brightness",
+    ),
+    Target(
+        id="resolve",
+        label="DaVinci Resolve (edit)",
+        default_subdir="Downloads/davinci",
+        tonemap_default=True,
+        tonemap_subtitle="Recommended for iPhone / HLG / Dolby Vision sources on Resolve Free",
+    ),
+    Target(
+        id="prores",
+        label="ProRes (Studio / Mac)",
+        default_subdir="Downloads/davinci",
+        tonemap_default=True,
+        tonemap_subtitle="Tone-map HDR unless you are finishing in an HDR timeline",
+    ),
+    Target(
+        id="web",
+        label="Web / YouTube / share",
+        default_subdir="Videos/VidPrep",
+        tonemap_default=True,
+        tonemap_subtitle="Tone-map HDR for browsers and social uploads",
+    ),
 ]
 
+
+@dataclass(frozen=True)
+class Preset:
+    id: str
+    target: str
+    label: str
+    tag: str
+    description: str
+    container: str
+    pix_fmt: str
+    video_args: tuple[str, ...]
+    audio_args: tuple[str, ...]
+    extra_args: tuple[str, ...] = ()
+
+
+PRESETS: list[Preset] = [
+    Preset(
+        id="iphone_h264",
+        target="iphone",
+        label="H.264 — Most compatible",
+        tag="iPhone, iPad, Apple TV, AirDrop",
+        description=(
+            "MP4 with H.264 + AAC and faststart. Best default for Photos, Messages, and older devices. "
+            "Use this for Resolve APV/FLAC exports that will not play on iOS."
+        ),
+        container=".mp4",
+        pix_fmt="yuv420p",
+        video_args=(
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "20",
+            "-profile:v",
+            "high",
+            "-level",
+            "4.2",
+        ),
+        audio_args=("-c:a", "aac", "-b:a", "192k"),
+        extra_args=("-movflags", "+faststart"),
+    ),
+    Preset(
+        id="iphone_h264_small",
+        target="iphone",
+        label="H.264 — Smaller file",
+        tag="iPhone / iPad",
+        description="Same compatibility as H.264 above, with a higher CRF for less disk/iCloud use.",
+        container=".mp4",
+        pix_fmt="yuv420p",
+        video_args=(
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-profile:v",
+            "high",
+            "-level",
+            "4.2",
+        ),
+        audio_args=("-c:a", "aac", "-b:a", "160k"),
+        extra_args=("-movflags", "+faststart"),
+    ),
+    Preset(
+        id="iphone_hevc",
+        target="iphone",
+        label="HEVC — Smaller (newer iPhones)",
+        tag="iPhone 7 and later · tagged hvc1 for Apple",
+        description=(
+            "H.265/HEVC MP4 — typically much smaller than H.264 at similar quality. "
+            "Prefer H.264 if you also send the file to non-Apple devices."
+        ),
+        container=".mp4",
+        pix_fmt="yuv420p",
+        video_args=("-c:v", "libx265", "-preset", "medium", "-crf", "22", "-tag:v", "hvc1"),
+        audio_args=("-c:a", "aac", "-b:a", "192k"),
+        extra_args=("-movflags", "+faststart"),
+    ),
+    Preset(
+        id="dnxhr_lb",
+        target="resolve",
+        label="DNxHR LB — Proxy / draft",
+        tag="DaVinci Resolve Free & Studio",
+        description="Smallest DNxHR intermediate. Good for quick offline edits or tight disk space.",
+        container=".mov",
+        pix_fmt="yuv422p",
+        video_args=("-c:v", "dnxhd", "-profile:v", "dnxhr_lb"),
+        audio_args=("-c:a", "pcm_s16le"),
+    ),
+    Preset(
+        id="dnxhr_sq",
+        target="resolve",
+        label="DNxHR SQ — Recommended edit quality",
+        tag="DaVinci Resolve Free & Studio",
+        description="Best balance of quality and file size for general editing.",
+        container=".mov",
+        pix_fmt="yuv422p",
+        video_args=("-c:v", "dnxhd", "-profile:v", "dnxhr_sq"),
+        audio_args=("-c:a", "pcm_s16le"),
+    ),
+    Preset(
+        id="dnxhr_hq",
+        target="resolve",
+        label="DNxHR HQ — Higher quality",
+        tag="DaVinci Resolve Free & Studio",
+        description="Extra quality headroom for heavier color work; larger files than SQ.",
+        container=".mov",
+        pix_fmt="yuv422p",
+        video_args=("-c:v", "dnxhd", "-profile:v", "dnxhr_hq"),
+        audio_args=("-c:a", "pcm_s16le"),
+    ),
+    Preset(
+        id="dnxhr_hqx",
+        target="resolve",
+        label="DNxHR HQX — 10-bit finishing",
+        tag="DaVinci Resolve Studio recommended",
+        description="10-bit 4:2:2 for HDR or color-critical finishing. Largest DNxHR files.",
+        container=".mov",
+        pix_fmt="yuv422p10le",
+        video_args=("-c:v", "dnxhd", "-profile:v", "dnxhr_hqx"),
+        audio_args=("-c:a", "pcm_s16le"),
+    ),
+    Preset(
+        id="cineform",
+        target="resolve",
+        label="GoPro CineForm — Lightweight alternative",
+        tag="DaVinci Resolve Free & Studio",
+        description=(
+            "Visually-lossless 10-bit intermediate. Encodes/decodes faster and is usually "
+            "smaller than DNxHR HQX."
+        ),
+        container=".mov",
+        pix_fmt="yuv422p10le",
+        video_args=("-c:v", "cfhd", "-quality", "film3+"),
+        audio_args=("-c:a", "pcm_s16le"),
+    ),
+    Preset(
+        id="prores422",
+        target="prores",
+        label="ProRes 422 — Cross-platform delivery",
+        tag="Resolve Studio / macOS — often undecodable on Resolve Free for Linux",
+        description=(
+            "Apple ProRes 422, 10-bit. Good when sharing with macOS editors or Studio. "
+            "Resolve Free on Linux typically cannot decode ProRes — use DNxHR there."
+        ),
+        container=".mov",
+        pix_fmt="yuv422p10le",
+        video_args=("-c:v", "prores_ks", "-profile:v", "2", "-vendor", "apl0"),
+        audio_args=("-c:a", "pcm_s16le"),
+    ),
+    Preset(
+        id="prores422hq",
+        target="prores",
+        label="ProRes 422 HQ — Higher-quality ProRes",
+        tag="Resolve Studio / macOS",
+        description="Higher-bitrate ProRes for critical finishing with more headroom than standard 422.",
+        container=".mov",
+        pix_fmt="yuv422p10le",
+        video_args=("-c:v", "prores_ks", "-profile:v", "3", "-vendor", "apl0"),
+        audio_args=("-c:a", "pcm_s16le"),
+    ),
+    Preset(
+        id="web_h264",
+        target="web",
+        label="H.264 — YouTube / web",
+        tag="Browsers, YouTube, Discord, social",
+        description="Balanced MP4 for upload and embedding. Faststart enabled for quick scrubbing.",
+        container=".mp4",
+        pix_fmt="yuv420p",
+        video_args=("-c:v", "libx264", "-preset", "medium", "-crf", "20", "-profile:v", "high"),
+        audio_args=("-c:a", "aac", "-b:a", "192k"),
+        extra_args=("-movflags", "+faststart"),
+    ),
+    Preset(
+        id="h264proxy",
+        target="web",
+        label="H.264 — Quick review proxy",
+        tag="Review / sync only",
+        description=(
+            "Faster encode for rough cuts and client previews. "
+            "Re-convert to DNxHR/ProRes/CineForm before grading."
+        ),
+        container=".mp4",
+        pix_fmt="yuv420p",
+        video_args=("-c:v", "libx264", "-preset", "fast", "-crf", "23"),
+        audio_args=("-c:a", "aac", "-b:a", "160k"),
+        extra_args=("-movflags", "+faststart"),
+    ),
+]
+
+DEFAULT_TARGET_INDEX = next(i for i, t in enumerate(TARGETS) if t.id == "iphone")
+DEFAULT_PRESET_ID = "iphone_h264"
+
 TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+
+def format_bytes(num_bytes: float) -> str:
+    size = float(max(num_bytes, 0))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
 
 
 @dataclass
@@ -57,6 +307,8 @@ class Job:
     width: int = 0
     height: int = 0
     codec: str = ""
+    input_size: int = 0
+    output_size: int = 0
     status: str = "Queued"
     progress: float = 0.0
     error: str = ""
@@ -142,14 +394,14 @@ def is_hdr_stream(path: Path) -> bool:
     return False
 
 
-def output_path_for(source: Path, out_dir: Path) -> Path:
+def output_path_for(source: Path, out_dir: Path, preset: Preset) -> Path:
     stem = re.sub(r"[^\w.\-]+", "_", source.stem).strip("_") or "clip"
-    candidate = out_dir / f"{stem}_dnxhr.mov"
+    candidate = out_dir / f"{stem}_{preset.id}{preset.container}"
     if not candidate.exists():
         return candidate
     n = 2
     while True:
-        candidate = out_dir / f"{stem}_dnxhr_{n}.mov"
+        candidate = out_dir / f"{stem}_{preset.id}_{n}{preset.container}"
         if not candidate.exists():
             return candidate
         n += 1
@@ -158,13 +410,12 @@ def output_path_for(source: Path, out_dir: Path) -> Path:
 def build_ffmpeg_cmd(
     source: Path,
     dest: Path,
-    profile: str,
+    preset: Preset,
     tonemap: bool,
 ) -> list[str]:
     ffmpeg = which_ffmpeg()
     assert ffmpeg
 
-    pix_fmt = "yuv422p10le" if profile == "dnxhr_hqx" else "yuv422p"
     cmd = [
         ffmpeg,
         "-y",
@@ -185,46 +436,68 @@ def build_ffmpeg_cmd(
         filters.append(
             "zscale=t=linear:npl=100,format=gbrpf32le,"
             "zscale=p=bt709,tonemap=hable:desat=0,"
-            f"zscale=t=bt709:m=bt709:r=tv,format={pix_fmt}"
+            f"zscale=t=bt709:m=bt709:r=tv,format={preset.pix_fmt}"
         )
     else:
-        filters.append(f"format={pix_fmt}")
+        filters.append(f"format={preset.pix_fmt}")
 
     cmd.extend(["-vf", ",".join(filters)])
-    cmd.extend(
-        [
-            "-c:v",
-            "dnxhd",
-            "-profile:v",
-            profile,
-            "-c:a",
-            "pcm_s16le",
-            str(dest),
-        ]
-    )
+    cmd.extend(preset.video_args)
+    cmd.extend(preset.audio_args)
+    cmd.extend(preset.extra_args)
+    cmd.append(str(dest))
     return cmd
 
 
-def parse_progress_line(line: str, duration: float) -> float | None:
-    if line.startswith("out_time_ms="):
+def presets_for_target(target_id: str) -> list[Preset]:
+    return [p for p in PRESETS if p.target == target_id]
+
+
+def default_output_dir(target: Target) -> Path:
+    path = Path.home() / target.default_subdir
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _safe_float(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        return float(value.rstrip("x"))
+    except ValueError:
+        return 0.0
+
+
+def _safe_int(value: str | None) -> int:
+    if not value:
+        return 0
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
+def frac_from_snapshot(snapshot: dict[str, str], duration: float) -> float | None:
+    if duration <= 0:
+        return None
+    if "out_time_ms" in snapshot:
         try:
-            ms = int(line.split("=", 1)[1])
-            if duration > 0:
-                return min(max(ms / (duration * 1_000_000), 0.0), 1.0)
+            ms = int(snapshot["out_time_ms"])
+            return min(max(ms / (duration * 1_000_000), 0.0), 1.0)
         except ValueError:
-            return None
-    if line.startswith("out_time="):
-        match = TIME_RE.search(line.replace("out_time=", "time="))
-        if match and duration > 0:
+            pass
+    if "out_time" in snapshot:
+        match = TIME_RE.search(f"time={snapshot['out_time']}")
+        if match:
             h, m, s = match.groups()
             seconds = int(h) * 3600 + int(m) * 60 + float(s)
             return min(max(seconds / duration, 0.0), 1.0)
     return None
 
 
-class ResolvePrepWindow(Adw.ApplicationWindow):
+class VidPrepWindow(Adw.ApplicationWindow):
     def __init__(self, app: Adw.Application) -> None:
-        super().__init__(application=app, title=APP_NAME, default_width=780, default_height=620)
+        super().__init__(application=app, title=APP_NAME, default_width=820, default_height=640)
         self.set_icon_name("applications-multimedia")
 
         self.jobs: list[Job] = []
@@ -232,10 +505,10 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
         self._proc: subprocess.Popen | None = None
         self._cancel = threading.Event()
         self._busy = False
+        self._preset_choices: list[Preset] = []
+        self._auto_folder = True
 
-        downloads = Path.home() / "Downloads" / "davinci"
-        downloads.mkdir(parents=True, exist_ok=True)
-        self.output_dir = downloads
+        self.output_dir = default_output_dir(TARGETS[DEFAULT_TARGET_INDEX])
 
         self._build_ui()
         self._update_sensitivity()
@@ -285,23 +558,42 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
         out_row.add_suffix(browse)
         prefs.add(out_row)
 
-        self.profile_row = Adw.ComboRow(title="Codec profile")
-        model = Gtk.StringList()
-        for _, label in PROFILES:
-            model.append(label)
-        self.profile_row.set_model(model)
-        self.profile_row.set_selected(1)  # SQ
-        prefs.add(self.profile_row)
+        self.target_row = Adw.ComboRow(title="Target")
+        target_model = Gtk.StringList()
+        for target in TARGETS:
+            target_model.append(target.label)
+        self.target_row.set_model(target_model)
+        self.target_row.set_selected(DEFAULT_TARGET_INDEX)
+        self.target_row.connect("notify::selected", self._on_target_changed)
+        prefs.add(self.target_row)
+
+        self.preset_row = Adw.ComboRow(title="Preset")
+        self.preset_row.connect("notify::selected", self._on_preset_changed)
+        prefs.add(self.preset_row)
 
         self.tonemap_row = Adw.SwitchRow(
             title="Tone-map HDR to Rec.709",
-            subtitle="Recommended for iPhone / HLG / Dolby Vision clips on Resolve Free",
-            active=True,
+            subtitle=TARGETS[DEFAULT_TARGET_INDEX].tonemap_subtitle,
+            active=TARGETS[DEFAULT_TARGET_INDEX].tonemap_default,
         )
         prefs.add(self.tonemap_row)
 
+        self.preset_info = Gtk.Label(wrap=True, xalign=0)
+        self.preset_info.add_css_class("dim-label")
+        self.preset_info.add_css_class("caption")
+        self.preset_info.set_margin_start(4)
+        self.preset_info.set_margin_end(4)
+        outer.append(self.preset_info)
+
+        self._reload_presets(preferred_id=DEFAULT_PRESET_ID)
+
         queue_group = Adw.PreferencesGroup(title="Queue")
         outer.append(queue_group)
+
+        self.queue_summary = Gtk.Label(xalign=0, wrap=True)
+        self.queue_summary.add_css_class("dim-label")
+        self.queue_summary.set_visible(False)
+        outer.append(self.queue_summary)
 
         self.drop_hint = Gtk.Label(
             label="Drop video files here, or use Add Videos",
@@ -328,6 +620,12 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
         self.overall.set_text("Idle")
         outer.append(self.overall)
 
+        self.stats_label = Gtk.Label(xalign=0, wrap=True)
+        self.stats_label.add_css_class("dim-label")
+        self.stats_label.add_css_class("caption")
+        self.stats_label.set_visible(False)
+        outer.append(self.stats_label)
+
         self.status = Gtk.Label(label=self._ffmpeg_status_text(), xalign=0)
         self.status.add_css_class("dim-label")
         outer.append(self.status)
@@ -338,12 +636,76 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
 
     def _ffmpeg_status_text(self) -> str:
         if which_ffmpeg() and which_ffprobe():
-            return "Ready — converts to DNxHR in .mov with PCM audio for DaVinci Resolve (Linux)."
+            return "Ready — convert for iPhone, DaVinci Resolve, ProRes, or the web."
         return "ffmpeg/ffprobe not found. Install ffmpeg to convert."
 
-    def _selected_profile(self) -> str:
-        idx = self.profile_row.get_selected()
-        return PROFILES[idx][0]
+    def _selected_target(self) -> Target:
+        idx = self.target_row.get_selected()
+        if idx < 0 or idx >= len(TARGETS):
+            return TARGETS[DEFAULT_TARGET_INDEX]
+        return TARGETS[idx]
+
+    def _selected_preset(self) -> Preset:
+        if not self._preset_choices:
+            return PRESETS[0]
+        idx = self.preset_row.get_selected()
+        if idx < 0 or idx >= len(self._preset_choices):
+            return self._preset_choices[0]
+        return self._preset_choices[idx]
+
+    def _on_target_changed(self, _row: Adw.ComboRow, _param) -> None:
+        target = self._selected_target()
+        self.tonemap_row.set_subtitle(target.tonemap_subtitle)
+        self.tonemap_row.set_active(target.tonemap_default)
+        if self._auto_folder:
+            self.output_dir = default_output_dir(target)
+            self.out_row.set_subtitle(str(self.output_dir))
+        preferred = "dnxhr_sq" if target.id == "resolve" else None
+        if target.id == "iphone":
+            preferred = "iphone_h264"
+        elif target.id == "prores":
+            preferred = "prores422"
+        elif target.id == "web":
+            preferred = "web_h264"
+        self._reload_presets(preferred_id=preferred)
+
+    def _reload_presets(self, preferred_id: str | None = None) -> None:
+        target = self._selected_target()
+        self._preset_choices = presets_for_target(target.id)
+        model = Gtk.StringList()
+        selected = 0
+        for i, preset in enumerate(self._preset_choices):
+            model.append(preset.label)
+            if preferred_id and preset.id == preferred_id:
+                selected = i
+        self.preset_row.set_model(model)
+        if self._preset_choices:
+            self.preset_row.set_selected(selected)
+        self._update_preset_info()
+
+    def _on_preset_changed(self, _row: Adw.ComboRow, _param) -> None:
+        self._update_preset_info()
+
+    def _update_preset_info(self) -> None:
+        if not self._preset_choices:
+            self.preset_info.set_label("")
+            return
+        preset = self._selected_preset()
+        self.preset_info.set_label(f"{preset.tag} — {preset.description}")
+
+    def _update_queue_summary(self) -> None:
+        if not self.jobs:
+            self.queue_summary.set_visible(False)
+            return
+        total_size = sum(j.input_size for j in self.jobs)
+        total_duration = sum(j.duration for j in self.jobs)
+        count = len(self.jobs)
+        self.queue_summary.set_label(
+            f"{count} file{'s' if count != 1 else ''} queued · "
+            f"{format_duration(total_duration)} total runtime · "
+            f"{format_bytes(total_size)} total size"
+        )
+        self.queue_summary.set_visible(True)
 
     def _update_sensitivity(self) -> None:
         has_jobs = bool(self.jobs)
@@ -365,6 +727,7 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
             self.output_dir = Path(folder.get_path())
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self.out_row.set_subtitle(str(self.output_dir))
+            self._auto_folder = False
 
     def _on_add_clicked(self, _btn: Gtk.Button) -> None:
         dialog = Gtk.FileDialog(title="Add videos")
@@ -416,11 +779,23 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
             if resolved in existing:
                 continue
             duration, width, height, codec = probe_media(path)
-            job = Job(path=path, duration=duration, width=width, height=height, codec=codec)
+            try:
+                input_size = path.stat().st_size
+            except OSError:
+                input_size = 0
+            job = Job(
+                path=path,
+                duration=duration,
+                width=width,
+                height=height,
+                codec=codec,
+                input_size=input_size,
+            )
             self.jobs.append(job)
             self._append_row(job)
             existing.add(resolved)
         self._update_sensitivity()
+        self._update_queue_summary()
 
     def _append_row(self, job: Job) -> None:
         row = Gtk.ListBoxRow()
@@ -452,6 +827,8 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
             mins, secs = divmod(int(job.duration), 60)
             hrs, mins = divmod(mins, 60)
             meta_bits.append(f"{hrs}:{mins:02d}:{secs:02d}" if hrs else f"{mins}:{secs:02d}")
+        if job.input_size:
+            meta_bits.append(format_bytes(job.input_size))
         meta = Gtk.Label(label=" · ".join(meta_bits) or str(job.path), xalign=0)
         meta.add_css_class("dim-label")
         meta.set_ellipsize(Pango.EllipsizeMode.END)
@@ -478,6 +855,7 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
         if job.row:
             self.list_box.remove(job.row)
         self._update_sensitivity()
+        self._update_queue_summary()
 
     def _on_clear_clicked(self, _btn: Gtk.Button) -> None:
         if self._busy:
@@ -490,7 +868,9 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
             self.list_box.remove(row)
         self.overall.set_fraction(0)
         self.overall.set_text("Idle")
+        self.stats_label.set_visible(False)
         self._update_sensitivity()
+        self._update_queue_summary()
 
     def _on_cancel_clicked(self, _btn: Gtk.Button) -> None:
         self._cancel.set()
@@ -511,28 +891,44 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
         self._cancel.clear()
         self._busy = True
         self._update_sensitivity()
-        profile = self._selected_profile()
+        preset = self._selected_preset()
         tonemap = self.tonemap_row.get_active()
         jobs = list(self.jobs)
+        self.stats_label.set_visible(True)
         self._worker = threading.Thread(
             target=self._run_jobs,
-            args=(jobs, profile, tonemap, self.output_dir),
+            args=(jobs, preset, tonemap, self.output_dir),
             daemon=True,
         )
         self._worker.start()
 
-    def _run_jobs(self, jobs: list[Job], profile: str, tonemap: bool, out_dir: Path) -> None:
+    def _run_jobs(self, jobs: list[Job], preset: Preset, tonemap: bool, out_dir: Path) -> None:
         total = len(jobs)
+        run_start = time.monotonic()
+        total_input_bytes = sum(j.input_size for j in jobs)
+        completed_output_bytes = 0
+        done = 0
+        failed = 0
+
         for index, job in enumerate(jobs):
             if self._cancel.is_set():
                 GLib.idle_add(self._set_job_status, job, "Cancelled", job.progress)
                 break
 
-            dest = output_path_for(job.path, out_dir)
+            dest = output_path_for(job.path, out_dir, preset)
+            job_start = time.monotonic()
             GLib.idle_add(self._set_job_status, job, f"Converting → {dest.name}", 0.0)
-            GLib.idle_add(self.overall.set_text, f"File {index + 1} of {total}: {job.path.name}")
+            GLib.idle_add(
+                self._update_live_stats,
+                index,
+                total,
+                job.path.name,
+                0.0,
+                completed_output_bytes,
+                run_start,
+            )
 
-            cmd = build_ffmpeg_cmd(job.path, dest, profile, tonemap)
+            cmd = build_ffmpeg_cmd(job.path, dest, preset, tonemap)
             try:
                 self._proc = subprocess.Popen(
                     cmd,
@@ -542,6 +938,7 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
                     start_new_session=True,
                 )
             except OSError as exc:
+                failed += 1
                 GLib.idle_add(self._set_job_status, job, f"Failed: {exc}", 0.0)
                 continue
 
@@ -557,13 +954,34 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
             err_thread = threading.Thread(target=read_stderr, daemon=True)
             err_thread.start()
 
-            for line in self._proc.stdout:
-                line = line.strip()
-                frac = parse_progress_line(line, job.duration)
-                if frac is not None:
-                    overall = (index + frac) / total
-                    GLib.idle_add(self._set_job_status, job, f"Converting… {int(frac * 100)}%", frac)
-                    GLib.idle_add(self.overall.set_fraction, overall)
+            snapshot: dict[str, str] = {}
+            for raw_line in self._proc.stdout:
+                line = raw_line.strip()
+                if not line or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                snapshot[key] = value
+                if key == "progress":
+                    frac = frac_from_snapshot(snapshot, job.duration)
+                    if frac is not None:
+                        job.progress = frac
+                    fps = _safe_float(snapshot.get("fps"))
+                    speed = _safe_float(snapshot.get("speed"))
+                    out_bytes = _safe_int(snapshot.get("total_size"))
+                    eta = None
+                    if frac and frac > 0.01:
+                        eta = (time.monotonic() - job_start) * (1 / frac - 1)
+                    GLib.idle_add(self._update_job_progress, job, job.progress, fps, speed, eta)
+                    GLib.idle_add(
+                        self._update_live_stats,
+                        index,
+                        total,
+                        job.path.name,
+                        job.progress,
+                        completed_output_bytes + out_bytes,
+                        run_start,
+                    )
+                    snapshot = {}
                 if self._cancel.is_set():
                     try:
                         os.killpg(self._proc.pid, signal.SIGTERM)
@@ -585,14 +1003,21 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
                 break
 
             if code == 0 and dest.exists():
-                size_gb = dest.stat().st_size / (1024**3)
-                GLib.idle_add(
-                    self._set_job_status,
-                    job,
-                    f"Done — {dest.name} ({size_gb:.1f} GB)",
-                    1.0,
+                output_size = dest.stat().st_size
+                job.output_size = output_size
+                completed_output_bytes += output_size
+                done += 1
+                elapsed_job = time.monotonic() - job_start
+                speed = job.duration / elapsed_job if elapsed_job > 0 else 0.0
+                ratio_pct = (output_size / job.input_size * 100) if job.input_size else 0.0
+                status = (
+                    f"Done — {dest.name} · {format_bytes(output_size)} "
+                    f"({ratio_pct:.0f}% of source) · {format_duration(elapsed_job)} "
+                    f"· {speed:.2g}x realtime"
                 )
+                GLib.idle_add(self._set_job_status, job, status, 1.0)
             else:
+                failed += 1
                 err = "".join(stderr_chunks[-20:]).strip() or f"ffmpeg exited {code}"
                 if dest.exists():
                     try:
@@ -603,11 +1028,25 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
 
         def finish() -> None:
             self._busy = False
+            elapsed_total = time.monotonic() - run_start
             if self._cancel.is_set():
                 self.overall.set_text("Cancelled")
+                self.stats_label.set_label(
+                    f"Stopped after {format_duration(elapsed_total)} · "
+                    f"{done} of {total} converted"
+                )
             else:
                 self.overall.set_fraction(1.0)
                 self.overall.set_text("Finished")
+                delta = completed_output_bytes - total_input_bytes
+                sign = "+" if delta >= 0 else "-"
+                summary = (
+                    f"{done} of {total} converted"
+                    + (f", {failed} failed" if failed else "")
+                    + f" · {format_bytes(total_input_bytes)} → {format_bytes(completed_output_bytes)}"
+                    f" ({sign}{format_bytes(abs(delta))}) · {format_duration(elapsed_total)} elapsed"
+                )
+                self.stats_label.set_label(summary)
             self._update_sensitivity()
 
         GLib.idle_add(finish)
@@ -620,18 +1059,49 @@ class ResolvePrepWindow(Adw.ApplicationWindow):
         if job.progress_bar:
             job.progress_bar.set_fraction(progress)
 
+    def _update_job_progress(
+        self, job: Job, frac: float, fps: float, speed: float, eta: float | None
+    ) -> None:
+        bits = [f"Converting… {int(frac * 100)}%"]
+        if speed > 0:
+            bits.append(f"{speed:.2g}x")
+        if fps > 0:
+            bits.append(f"{fps:.0f}fps")
+        if eta is not None and eta > 0:
+            bits.append(f"ETA {format_duration(eta)}")
+        self._set_job_status(job, " · ".join(bits), frac)
+
+    def _update_live_stats(
+        self,
+        job_index: int,
+        total_jobs: int,
+        name: str,
+        frac: float,
+        written_bytes: int,
+        run_start: float,
+    ) -> None:
+        overall_frac = (job_index + frac) / total_jobs
+        self.overall.set_fraction(overall_frac)
+        self.overall.set_text(f"File {job_index + 1} of {total_jobs}: {name} ({int(frac * 100)}%)")
+        elapsed = time.monotonic() - run_start
+        bits = [f"{format_bytes(written_bytes)} written", f"elapsed {format_duration(elapsed)}"]
+        if overall_frac > 0.02:
+            eta = elapsed * (1 / overall_frac - 1)
+            bits.append(f"ETA ~{format_duration(eta)}")
+        self.stats_label.set_label(" · ".join(bits))
+
     def _toast(self, message: str) -> None:
         self.status.set_label(message)
 
 
-class ResolvePrepApp(Adw.Application):
+class VidPrepApp(Adw.Application):
     def __init__(self) -> None:
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN)
-        self.window: ResolvePrepWindow | None = None
+        self.window: VidPrepWindow | None = None
 
     def do_activate(self) -> None:  # noqa: N802
         if not self.window:
-            self.window = ResolvePrepWindow(self)
+            self.window = VidPrepWindow(self)
         self.window.present()
 
     def do_open(self, files: list[Gio.File], _n_files: int, _hint: str) -> None:  # noqa: N802
@@ -643,7 +1113,7 @@ class ResolvePrepApp(Adw.Application):
 
 def main() -> int:
     Adw.init()
-    app = ResolvePrepApp()
+    app = VidPrepApp()
     return app.run(sys.argv)
 
 
