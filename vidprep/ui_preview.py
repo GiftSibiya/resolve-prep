@@ -49,7 +49,9 @@ class PreviewPanel(Gtk.Box):
         frame.set_child(overlay)
 
         self.video = Gtk.Video()
-        self.video.set_controls(False)
+        # GTK 4.24+ dropped Gtk.Video:controls; we use our own transport bar.
+        if hasattr(self.video, "set_controls"):
+            self.video.set_controls(False)
         self.video.set_autoplay(False)
         self.video.set_loop(False)
         self.video.set_hexpand(True)

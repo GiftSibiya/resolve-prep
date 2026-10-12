@@ -21,9 +21,15 @@ class VidPrepApp(Adw.Application):
         self.window: VidPrepWindow | None = None
 
     def do_activate(self) -> None:  # noqa: N802
-        if not self.window:
-            self.window = VidPrepWindow(self)
-        self.window.present()
+        try:
+            if not self.window:
+                self.window = VidPrepWindow(self)
+            self.window.present()
+        except Exception:
+            import traceback
+
+            traceback.print_exc()
+            self.quit()
 
     def do_open(self, files: list[Gio.File], _n_files: int, _hint: str) -> None:  # noqa: N802
         self.activate()
