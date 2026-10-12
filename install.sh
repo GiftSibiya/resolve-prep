@@ -21,3 +21,5 @@ echo "Installed: VidPrep"
 echo "  launcher: $BIN_DIR/vidprep  (also: resolve-prep)"
 echo "  menu:     VidPrep"
 echo "Run: vidprep"
+echo
+echo "Preview (optional): sudo pacman -S gst-plugin-gtk4 gst-plugins-good gst-libav"
