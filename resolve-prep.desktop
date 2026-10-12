@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Resolve Prep
+Comment=Convert videos to DNxHR for DaVinci Resolve
+Exec=/home/bobo/Development/Gift/resolve-prep/resolve-prep.py %F
+Icon=applications-multimedia
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+MimeType=video/mp4;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;
+StartupNotify=true
+Keywords=davinci;resolve;dnxhr;ffmpeg;convert;

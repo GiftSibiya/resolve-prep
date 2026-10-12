@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.mov
+*.mkv
+*.mp4
+.DS_Store
+*.log
