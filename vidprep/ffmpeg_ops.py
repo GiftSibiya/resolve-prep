@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -50,6 +52,34 @@ def probe_media(path: Path) -> tuple[float, int, int, str]:
                 duration = float(stream.get("duration") or 0)
             break
     return duration, width, height, codec
+
+
+def preview_proxy_path(source: Path) -> Path:
+    """Cache path for a low-res H.264 preview proxy, keyed by path, size and mtime."""
+    st = source.stat()
+    key = f"{source.resolve()}|{st.st_size}|{st.st_mtime_ns}"
+    digest = hashlib.sha1(key.encode()).hexdigest()[:16]
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return cache / "vidprep" / "proxies" / f"{source.stem}-{digest}.mp4"
+
+
+def build_proxy_cmd(source: Path, dest: Path) -> list[str]:
+    """Transcode to something GStreamer can always play; short GOP keeps scrubbing snappy."""
+    ffmpeg = which_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found")
+    return [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(source),
+        "-map", "0:v:0", "-map", "0:a:0?", "-dn",
+        "-map_metadata", "-1", "-map_chapters", "-1",
+        "-vf", "scale=-2:'min(540,ih)'",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-g", "12",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(dest),
+    ]
 
 
 def is_hdr_stream(path: Path) -> bool:

@@ -2,4 +2,4 @@
 
 APP_ID = "dev.bobo.vidprep"
 APP_NAME = "VidPrep"
-__version__ = "0.4.0"
+__version__ = "0.4.1"

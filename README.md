@@ -20,6 +20,8 @@ sudo pacman -S python-gobject gtk4 libadwaita ffmpeg \
 
 Without the GStreamer packages, Convert and In/Out timecode fields still work; the preview pane shows a fallback message.
 
+Clips GStreamer can't decode (e.g. Samsung APV, some ProRes/DNxHR) are previewed through a low-res H.264 proxy that ffmpeg builds on first load and caches in `~/.cache/vidprep/proxies/`.
+
 ## Install
 
 ```bash
